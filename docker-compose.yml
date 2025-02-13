@@ -1,13 +1,47 @@
 # filepath: /Users/yashdargude/Downloads/steps_AI/docker-compose.yml
 
-version: "3.8"
+version: "3.9"
 
 services:
-  web:
+  app:
     build: .
+    restart: always
     ports:
       - "8000:8000"
-    volumes:
-      - .:/app
+    depends_on:
+      - redis
+      - db
     environment:
-      - ENV=development
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_URL=${OPENAI_API_URL}
+      - DATABASE_URL=postgresql://postgres:postgres@db/postgres
+
+  celery_worker:
+    build: .
+    command: celery -A celery_worker.celery_app worker --loglevel=info
+    depends_on:
+      - redis
+      - db
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_URL=${OPENAI_API_URL}
+      - DATABASE_URL=postgresql://postgres:postgres@db/postgres
+
+  redis:
+    image: redis:6-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:

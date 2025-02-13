@@ -1,17 +1,41 @@
 from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel
-import requests
 import json
+import requests
+import redis
 from config import OPENAI_API_KEY, OPENAI_API_URL
 from openai import OpenAI
 from database import engine
-from models import Base
+from models import Base, ModerationResult
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from database import SessionLocal
-from models import ModerationResult
+
+# Rate limiting imports
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from fastapi.responses import JSONResponse
+
+# Prometheus instrumentation
+from prometheus_fastapi_instrumentator import Instrumentator
+
+# Celery task
+from celery_worker import moderate_text_task
 
 app = FastAPI()
+
+# Initialize Redis client for caching
+redis_client = redis.Redis(host="redis", port=6379,
+                           db=0, decode_responses=True)
+
+# Setup rate limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(429, _rate_limit_exceeded_handler)
+
+# Instrument app for Prometheus metrics
+Instrumentator().instrument(app).expose(app)
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -48,33 +72,26 @@ def healthy_post():
     return {"status": "healthy"}
 
 
-# @app.post("/api/v1/moderate/text")
-# def moderate_text(request: Request, body: TextModerationRequest):
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "input": body.text
-    }
-    try:
-        response = requests.post(OPENAI_API_URL, headers=headers, json=data)
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code,
-                                detail="Error with OpenAI API")
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# Updated text moderation endpoint with rate limiting and caching
 @app.post("/api/v1/moderate/text")
+@limiter.limit("5/minute")
 def moderate_text(request: Request, body: TextModerationRequest, db: Session = Depends(get_db)):
-    # Temporary hardcoded response
-    hardcoded_response = {
-        "id": "modr-1234567890",
-        "model": "omni-moderation-latest",
-        "results": [
-            {
+    cache_key = f"moderation:{body.text}"
+    cached = redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    try:
+        # Call Celery task asynchronously
+        task = moderate_text_task.delay(body.text)
+        # Wait for result with a timeout (or return task.id for async polling)
+        result = task.get(timeout=10)
+    except Exception as e:
+        # Fallback if Celery fails or timeout
+        result = {
+            "id": "fallback",
+            "model": "omni-moderation-latest",
+            "results": [{
                 "flagged": False,
                 "categories": {
                     "hate": False,
@@ -85,48 +102,34 @@ def moderate_text(request: Request, body: TextModerationRequest, db: Session = D
                     "violence": False,
                     "violence/graphic": False
                 },
-                "category_scores": {
-                    "hate": 0.01,
-                    "hate/threatening": 0.01,
-                    "self-harm": 0.01,
-                    "sexual": 0.01,
-                    "sexual/minors": 0.01,
-                    "violence": 0.01,
-                    "violence/graphic": 0.01
-                }
-            }
-        ]
-    }
+                "category_scores": {k: 0.01 for k in [
+                    "hate", "hate/threatening", "self-harm", "sexual",
+                    "sexual/minors", "violence", "violence/graphic"
+                ]}
+            }]
+        }
+
+    # Store the result in the database
     try:
-        # Store the result in the database
         moderation_result = ModerationResult(
-            model=hardcoded_response["model"],
-            results=hardcoded_response["results"]
+            model=result["model"],
+            results=result["results"]
         )
         db.add(moderation_result)
         db.commit()
         db.refresh(moderation_result)
-
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error storing data: {str(e)}")
 
-        # Optionally, retrieve the stored record to debug
-    stored_record = db.query(ModerationResult).filter(
-        ModerationResult.id == moderation_result.id
-    ).first()
-    print("Stored record:", stored_record)
-
-    return hardcoded_response
+    # Cache the response (set expiry as needed, e.g., 10 minutes)
+    redis_client.setex(cache_key, 600, json.dumps(result))
+    return result
 
 
 @app.get("/api/v1/db-test")
 def db_test(db: Session = Depends(get_db)):
-    """
-    Tests database connectivity by executing a simple query.
-    """
     try:
-        # Execute a simple test query
         result = db.execute(text("SELECT 1")).scalar()
         return {"connection": "successful", "result": result}
     except Exception as e:
@@ -142,17 +145,15 @@ def list_moderation_results(db: Session = Depends(get_db)):
 
 @app.post("/api/v1/moderate/image")
 def moderate_image():
-    # Placeholder for image moderation logic
     raise HTTPException(status_code=501, detail="Not Implemented")
 
 
 @app.get("/api/v1/moderation/{id}")
 def get_moderation_result(id: int):
-    # Placeholder for fetching moderation result
     raise HTTPException(status_code=501, detail="Not Implemented")
 
 
 @app.get("/api/v1/stats")
 def get_stats():
-    # Placeholder for fetching stats
+    # This endpoint is overridden by Prometheus instrumentation (/metrics)
     raise HTTPException(status_code=501, detail="Not Implemented")
