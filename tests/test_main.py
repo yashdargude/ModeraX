@@ -10,7 +10,7 @@ client = TestClient(app)
 
 @pytest.fixture(scope="module", autouse=True)
 def cleanup_db():
-    # Setup: remove existing ModerationResults before running tests
+    # Setup: remove existing ModerationResults before tests
     db = SessionLocal()
     db.query(ModerationResult).delete()
     db.commit()
@@ -35,11 +35,11 @@ def test_healthy_post():
 
 
 def test_moderate_text_caching(monkeypatch):
-    test_text = "this is a test"
+    test_text = "this is a caching test"
     cache_key = f"moderation:{test_text}"
     redis_client.delete(cache_key)
 
-    # Create a fake task object to simulate calling a Celery task
+    # Patch the Celery task delay method so it returns a fake task
     class FakeTask:
         def get(self, timeout):
             return {
@@ -62,16 +62,16 @@ def test_moderate_text_caching(monkeypatch):
                     ]}
                 }]
             }
-
-    # Patch the Celery task's delay method so it returns our fake task
     monkeypatch.setattr(
         "celery_worker.moderate_text_task.delay", lambda text: FakeTask())
+
+    # First call should not use cache.
     response = client.post("/api/v1/moderate/text", json={"text": test_text})
     assert response.status_code == 200
     data = response.json()
     assert data.get("model") == "omni-moderation-latest"
 
-    # Check that subsequent call returns a cached result
+    # Second call should get result from Redis cache.
     response2 = client.post("/api/v1/moderate/text", json={"text": test_text})
     assert response2.status_code == 200
     data2 = response2.json()
